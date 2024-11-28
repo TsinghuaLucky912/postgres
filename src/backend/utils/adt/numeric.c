@@ -32,6 +32,7 @@
 #include "lib/hyperloglog.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
+#include "optimizer/optimizer.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
 #include "utils/array.h"
@@ -1827,6 +1828,123 @@ generate_series_step_numeric(PG_FUNCTION_ARGS)
 		SRF_RETURN_DONE(funcctx);
 }
 
+
+/*
+ * Planner support function for generate_series(numeric, numeric [, numeric])
+ */
+Datum
+generate_series_numeric_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+	Node	   *ret = NULL;
+
+	if (IsA(rawreq, SupportRequestRows))
+	{
+		/* Try to estimate the number of rows returned */
+		SupportRequestRows *req = (SupportRequestRows *) rawreq;
+
+		if (is_funcclause(req->node))	/* be paranoid */
+		{
+			List	   *args = ((FuncExpr *) req->node)->args;
+			Node	   *arg1,
+					   *arg2,
+					   *arg3;
+
+			/* We can use estimated argument values here */
+			arg1 = estimate_expression_value(req->root, linitial(args));
+			arg2 = estimate_expression_value(req->root, lsecond(args));
+			if (list_length(args) >= 3)
+				arg3 = estimate_expression_value(req->root, lthird(args));
+			else
+				arg3 = NULL;
+
+			/*
+			 * If any argument is constant NULL, we can safely assume that
+			 * zero rows are returned.  Otherwise, if they're all non-NULL
+			 * constants, we can calculate the number of rows that will be
+			 * returned.  Use double arithmetic to avoid overflow hazards.
+			 */
+			if ((IsA(arg1, Const) &&
+				 ((Const *) arg1)->constisnull) ||
+				(IsA(arg2, Const) &&
+				 ((Const *) arg2)->constisnull) ||
+				(arg3 != NULL && IsA(arg3, Const) &&
+				 ((Const *) arg3)->constisnull))
+			{
+				req->rows = 0;
+				ret = (Node *) req;
+			}
+			else if (IsA(arg1, Const) &&
+					 IsA(arg2, Const) &&
+					 (arg3 == NULL || IsA(arg3, Const)))
+			{
+				Numeric		start,
+							finish,
+							step;
+				NumericVar	var_start,
+							var_finish,
+							var_diff;
+				NumericVar	nstep = const_one;
+
+				init_var(&var_start);
+				init_var(&var_finish);
+				init_var(&var_diff);
+
+				start = DatumGetNumeric(((Const *) arg1)->constvalue);
+				finish = DatumGetNumeric(((Const *) arg2)->constvalue);
+
+				if (NUMERIC_IS_SPECIAL(start) || NUMERIC_IS_SPECIAL(finish))
+				{
+					goto cleanup;
+				}
+
+				init_var_from_num(start, &var_start);
+				init_var_from_num(finish, &var_finish);
+
+				if (arg3)
+				{
+					step = DatumGetNumeric(((Const *) arg3)->constvalue);
+					if (NUMERIC_IS_SPECIAL(step))
+						goto cleanup;
+
+					init_var_from_num(step, &nstep);
+				}
+
+				sub_var(&var_finish, &var_start, &var_diff);
+
+				/* This equation works for either sign of step */
+				if (cmp_var(&nstep, &const_zero) != 0)
+				{
+					/* When the sign of the step size and the series range don't match, there are no rows in the series. */
+					if (nstep.sign != var_diff.sign)
+					{
+						req->rows = 0;
+						ret = (Node *) req;
+					}
+					else
+					{
+						NumericVar	q;
+
+						init_var(&q);
+						div_var(&var_diff, &nstep, &q, 0, false, false);
+
+						req->rows = numericvar_to_double_no_overflow(&q) + 1;
+						ret = (Node *) req;
+
+						free_var(&q);
+					}
+				}
+
+		cleanup:
+				free_var(&var_start);
+				free_var(&var_finish);
+				free_var(&var_diff);
+			}
+		}
+	}
+
+	PG_RETURN_POINTER(ret);
+}
 
 /*
  * Implements the numeric version of the width_bucket() function
